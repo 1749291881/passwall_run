@@ -504,115 +504,114 @@ jobs:
           PASSWALL_ROOTS_FILE="$PWD/.passwall-package-roots"
           [ -s "$PASSWALL_ROOTS_FILE" ] || die "PassWall root package list missing"
 
-          declare -A APK_INDEX=()
-          declare -A TOPLEVEL_PKGS=()
-          declare -A COPIED_PKGS=()
-          declare -A SEEN_PKGS=()
           declare -A MISSING_PKGS=()
-          declare -A MISSING_LOCAL_DEPS=()
           declare -A OFFICIAL_FETCH_PKGS=()
-          QUEUE=()
+          declare -A TOPLEVEL_PKGS=()
+          declare -A TOPLEVEL_FILES=()
 
-          queue_pkg() {
+          APK_TOOL="staging_dir/host/bin/apk"
+          ARCH_PACKAGES=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"/\1/p' .config | head -n 1)
+          LOCAL_REPO_ROOT="$PWD/.local-apk-repo"
+          LOCAL_REPO_ARCH_DIR="$LOCAL_REPO_ROOT/$ARCH_PACKAGES"
+          FETCH_DIR="$PWD/.resolved-apks"
+
+          [ -x "$APK_TOOL" ] || die "OpenWrt host apk tool not found: $APK_TOOL"
+          [ -n "$ARCH_PACKAGES" ] || die "Cannot derive ARCH_PACKAGES from .config"
+
+          find_pkg_file() {
+            local dir="$1" pkg="$2"
+            find "$dir" -maxdepth 1 -type f \( -name "${pkg}-*.apk" -o -name "${pkg}_*.apk" \) | LC_ALL=C sort | head -n 1
+          }
+
+          local_pkg_spec() {
+            local dir="$1" pkg="$2" pkg_file version
+            pkg_file=$(find_pkg_file "$dir" "$pkg" || true)
+            [ -n "$pkg_file" ] || return 1
+            version=$(basename "$pkg_file")
+            version="${version%.apk}"
+            version="${version#${pkg}-}"
+            version="${version#${pkg}_}"
+            [ -n "$version" ] || return 1
+            printf '%s=%s\n' "$pkg" "$version"
+          }
+
+          map_passwall_source_dir() {
             local pkg="$1"
-            [ -n "$pkg" ] || return 0
-            [ -n "${SEEN_PKGS[$pkg]+x}" ] && return 0
-            SEEN_PKGS["$pkg"]=1
-            QUEUE+=("$pkg")
+            case "$pkg" in
+              shadowsocks-libev-*) echo "package/passwall-packages/shadowsocks-libev" ;;
+              shadowsocks-rust-*) echo "package/passwall-packages/shadowsocks-rust" ;;
+              shadowsocksr-libev-*) echo "package/passwall-packages/shadowsocksr-libev" ;;
+              simple-obfs-*) echo "package/passwall-packages/simple-obfs" ;;
+              v2ray-geoip|v2ray-geosite) echo "package/passwall-packages/v2ray-geodata" ;;
+              luci-app-passwall|luci-i18n-passwall-zh-cn) echo "package/passwall-luci/luci-app-passwall" ;;
+              *)
+                [ -d "package/passwall-packages/$pkg" ] && echo "package/passwall-packages/$pkg" || return 1
+                ;;
+            esac
           }
 
-          index_apks() {
-            local apk_file pkg_name current
-            while IFS= read -r -d '' apk_file; do
-              pkg_name=$(apk_pkginfo_values "$apk_file" pkgname | head -n 1 || true)
-              if [ -z "$pkg_name" ]; then
-                log_warn "Skipping APK without pkgname metadata: $apk_file"
-                continue
-              fi
-              current="${APK_INDEX[$pkg_name]:-}"
-              if [ -z "$current" ] || [ "$apk_file" -nt "$current" ]; then
-                APK_INDEX["$pkg_name"]="$apk_file"
-              fi
-            done < <(find bin/packages -type f -name '*.apk' -print0)
+          build_local_repository() {
+            local apk_file
+            rm -rf "$LOCAL_REPO_ROOT"
+            mkdir -p "$LOCAL_REPO_ARCH_DIR"
+            mapfile -t LOCAL_APK_FILES < <(find bin/packages -type f -name '*.apk' | LC_ALL=C sort)
+            [ "${#LOCAL_APK_FILES[@]}" -gt 0 ] || die "No built APKs found in bin/packages"
+            for apk_file in "${LOCAL_APK_FILES[@]}"; do
+              cp -f "$apk_file" "$LOCAL_REPO_ARCH_DIR/"
+            done
+            mapfile -t LOCAL_REPO_APKS < <(find "$LOCAL_REPO_ARCH_DIR" -maxdepth 1 -type f -name '*.apk' | LC_ALL=C sort)
+            [ "${#LOCAL_REPO_APKS[@]}" -gt 0 ] || die "Local APK repository is empty"
+            "$APK_TOOL" mkndx -o "$LOCAL_REPO_ARCH_DIR/Packages.adb" "${LOCAL_REPO_APKS[@]}" \
+              || die "Failed to create local APK index"
           }
 
-          copy_indexed_pkg() {
-            local pkg="$1" dest="$2" apk_file
-            apk_file="${APK_INDEX[$pkg]:-}"
-            [ -n "$apk_file" ] || return 1
-            [ -n "${COPIED_PKGS[$pkg]+x}" ] && return 0
-            cp "$apk_file" "$dest/"
-            COPIED_PKGS["$pkg"]="$dest"
-            log_info "Collected $pkg → $(basename "$apk_file")"
-          }
-
-          enqueue_apk_dependencies() {
-            local pkg="$1" apk_file dep raw_dep
-            apk_file="${APK_INDEX[$pkg]:-}"
-            [ -n "$apk_file" ] || return 0
-            while IFS= read -r raw_dep; do
-              dep=$(normalize_apk_dependency "$raw_dep" || true)
-              [ -n "$dep" ] || continue
-              if [ -n "${APK_INDEX[$dep]+x}" ]; then
-                queue_pkg "$dep"
-              else
-                MISSING_LOCAL_DEPS["$dep"]=1
-                OFFICIAL_FETCH_PKGS["$dep"]=1
-              fi
-            done < <(apk_pkginfo_values "$apk_file" depend)
-          }
-
-          make_official_repositories() {
+          make_combined_repositories() {
             local repo_file="$1"
-            local dist_root target_path arch_packages
+            local dist_root target_path
             dist_root="${OPENWRT_SDK_URL%%/targets/*}"
             target_path=$(printf '%s' "$OPENWRT_SDK_URL" | sed -n 's#.*/targets/\([^/]*/[^/]*\)/.*#\1#p')
-            arch_packages=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"/\1/p' .config | head -n 1)
             [ -n "$dist_root" ] || die "Cannot derive OpenWrt dist root from SDK URL"
             [ -n "$target_path" ] || die "Cannot derive target path from SDK URL"
-            [ -n "$arch_packages" ] || die "Cannot derive ARCH_PACKAGES from .config"
             cat > "$repo_file" <<EOF
-          set APK_ARCH=$arch_packages
+          set APK_ARCH=$ARCH_PACKAGES
+          v3 $LOCAL_REPO_ROOT
           v3 $dist_root/targets/$target_path/packages
-          v3 $dist_root/packages/$arch_packages/base
-          v3 $dist_root/packages/$arch_packages/packages
-          v3 $dist_root/packages/$arch_packages/luci
-          v3 $dist_root/packages/$arch_packages/routing
-          v3 $dist_root/packages/$arch_packages/telephony
+          v3 $dist_root/packages/$ARCH_PACKAGES/base
+          v3 $dist_root/packages/$ARCH_PACKAGES/packages
+          v3 $dist_root/packages/$ARCH_PACKAGES/luci
+          v3 $dist_root/packages/$ARCH_PACKAGES/routing
+          v3 $dist_root/packages/$ARCH_PACKAGES/telephony
           EOF
           }
 
-          fetch_official_packages() {
+          fetch_resolved_packages() {
             local repo_file="$1" dest_dir="$2"
             shift 2
             [ "$#" -gt 0 ] || return 0
-            local apk_tool="staging_dir/host/bin/apk"
-            local arch_packages
-            arch_packages=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"/\1/p' .config | head -n 1)
-            [ -x "$apk_tool" ] || die "OpenWrt host apk tool not found: $apk_tool"
-            [ -n "$arch_packages" ] || die "Cannot derive ARCH_PACKAGES from .config"
-            "$apk_tool" \
+            rm -rf "$dest_dir"
+            mkdir -p "$dest_dir"
+            "$APK_TOOL" \
               --allow-untrusted \
               --force-missing-repositories \
               --force-refresh \
               --no-interactive \
-              --arch "$arch_packages" \
+              --arch "$ARCH_PACKAGES" \
               --repositories-file "$repo_file" \
               fetch --recursive -o "$dest_dir" "$@"
           }
 
           group_start "Collect packages"
-          index_apks
+          build_local_repository
 
-          [ -n "${APK_INDEX[luci-app-passwall]:-}" ] || die "luci-app-passwall APK not found"
-          copy_indexed_pkg "luci-app-passwall" "$PAYLOAD"
           TOPLEVEL_PKGS["luci-app-passwall"]=1
-          queue_pkg "luci-app-passwall"
+          luci_spec=$(local_pkg_spec "$LOCAL_REPO_ARCH_DIR" "luci-app-passwall" || true)
+          [ -n "$luci_spec" ] || die "luci-app-passwall APK not found in local repository"
+          REQUESTED_SPECS=("$luci_spec")
 
-          if [ -n "${APK_INDEX[luci-i18n-passwall-zh-cn]:-}" ]; then
-            copy_indexed_pkg "luci-i18n-passwall-zh-cn" "$PAYLOAD"
+          zh_spec=$(local_pkg_spec "$LOCAL_REPO_ARCH_DIR" "luci-i18n-passwall-zh-cn" || true)
+          if [ -n "$zh_spec" ]; then
             TOPLEVEL_PKGS["luci-i18n-passwall-zh-cn"]=1
-            queue_pkg "luci-i18n-passwall-zh-cn"
+            REQUESTED_SPECS+=("$zh_spec")
           else
             log_info "Chinese i18n package not found (non-critical)"
           fi
@@ -621,69 +620,66 @@ jobs:
           while IFS= read -r p; do
             [ -n "$p" ] || continue
             ROOT_COUNT=$((ROOT_COUNT + 1))
-            if [ -n "${APK_INDEX[$p]:-}" ]; then
-              queue_pkg "$p"
+            pkg_spec=$(local_pkg_spec "$LOCAL_REPO_ARCH_DIR" "$p" || true)
+            if [ -n "$pkg_spec" ]; then
+              REQUESTED_SPECS+=("$pkg_spec")
             else
-              OFFICIAL_FETCH_PKGS["$p"]=1
+              REQUESTED_SPECS+=("$p")
+              if map_passwall_source_dir "$p" >/dev/null 2>&1; then
+                MISSING_PKGS["$p"]=1
+              else
+                OFFICIAL_FETCH_PKGS["$p"]=1
+              fi
             fi
           done < "$PASSWALL_ROOTS_FILE"
 
-          queue_index=0
-          while [ "$queue_index" -lt "${#QUEUE[@]}" ]; do
-            pkg="${QUEUE[$queue_index]}"
-            queue_index=$((queue_index + 1))
-            if [ -n "${TOPLEVEL_PKGS[$pkg]+x}" ]; then
-              enqueue_apk_dependencies "$pkg"
-              continue
+          printf '%s\n' "${REQUESTED_SPECS[@]}" | sed '/^$/d' | LC_ALL=C sort -u > /tmp/passwall-requested-specs.txt
+          mapfile -t REQUESTED_SPECS < /tmp/passwall-requested-specs.txt
+
+          COMBINED_REPO_FILE="$PWD/.combined-repositories"
+          make_combined_repositories "$COMBINED_REPO_FILE"
+          fetch_resolved_packages "$COMBINED_REPO_FILE" "$FETCH_DIR" "${REQUESTED_SPECS[@]}" \
+            || die "Failed to resolve dependency closure from local and official repositories"
+
+          for pkg in "${!TOPLEVEL_PKGS[@]}"; do
+            pkg_file=$(find_pkg_file "$FETCH_DIR" "$pkg" || true)
+            if [ -n "$pkg_file" ]; then
+              cp "$pkg_file" "$PAYLOAD/"
+              TOPLEVEL_FILES["$(basename "$pkg_file")"]=1
+              log_info "Collected top-level $pkg → $(basename "$pkg_file")"
+            elif [ "$pkg" = "luci-i18n-passwall-zh-cn" ]; then
+              log_info "Chinese i18n package not resolved (non-critical)"
+            else
+              die "$pkg APK not found after dependency resolution"
             fi
-            copy_indexed_pkg "$pkg" "$DEPENDS" || {
-              MISSING_PKGS["$pkg"]=1
-              continue
-            }
-            enqueue_apk_dependencies "$pkg"
           done
 
-          OFFICIAL_REPO_FILE="$PWD/.official-repositories"
-          make_official_repositories "$OFFICIAL_REPO_FILE"
-
-          OFFICIAL_LIST=()
-          for pkg in "${!OFFICIAL_FETCH_PKGS[@]}"; do
-            OFFICIAL_LIST+=("$pkg")
-          done
-
-          if [ "${#OFFICIAL_LIST[@]}" -gt 0 ]; then
-            group_start "Fetch official dependency APKs"
-            printf '%s\n' "${OFFICIAL_LIST[@]}" | LC_ALL=C sort > /tmp/passwall-official-fetch.txt
-            mapfile -t OFFICIAL_LIST < /tmp/passwall-official-fetch.txt
-            fetch_official_packages "$OFFICIAL_REPO_FILE" "$DEPENDS" "${OFFICIAL_LIST[@]}" \
-              || die "Failed to fetch official dependency APKs"
-            group_end
-          fi
+          while IFS= read -r -d '' apk_file; do
+            base_name=$(basename "$apk_file")
+            [ -n "${TOPLEVEL_FILES[$base_name]+x}" ] && continue
+            cp "$apk_file" "$DEPENDS/"
+          done < <(find "$FETCH_DIR" -maxdepth 1 -type f -name '*.apk' -print0)
 
           DEP_COUNT=$(find "$DEPENDS" -maxdepth 1 -name '*.apk' | wc -l)
+          TOTAL_FETCHED=$(find "$FETCH_DIR" -maxdepth 1 -name '*.apk' | wc -l)
           MISSING_COUNT=${#MISSING_PKGS[@]}
-          log_info "Collected $DEP_COUNT dependency APKs from $ROOT_COUNT requested roots"
+          log_info "Resolved $TOTAL_FETCHED APKs and collected $DEP_COUNT dependency APKs from $ROOT_COUNT requested roots"
           [ "$MISSING_COUNT" -gt 0 ] && log_warn "Requested packages missing from artifacts: ${!MISSING_PKGS[*]}"
-          [ "${#MISSING_LOCAL_DEPS[@]}" -gt 0 ] && log_warn "Unresolved local dependency APKs: ${!MISSING_LOCAL_DEPS[*]}"
 
           {
             SUMMARY="## Payload Dependency Closure"$'\n'
             SUMMARY+="- Requested root packages: $ROOT_COUNT"$'\n'
+            SUMMARY+="- Resolved APK set: $TOTAL_FETCHED"$'\n'
             SUMMARY+="- Collected dependency APKs: $DEP_COUNT"$'\n'
-            SUMMARY+="- Missing requested APKs: ${#MISSING_PKGS[@]}"$'\n'
-            SUMMARY+="- Unresolved local dependencies: ${#MISSING_LOCAL_DEPS[@]}"$'\n'
-            SUMMARY+="- Officially fetched dependency roots: ${#OFFICIAL_FETCH_PKGS[@]}"$'\n'
+            SUMMARY+="- Missing locally built requested APKs: ${#MISSING_PKGS[@]}"$'\n'
+            SUMMARY+="- Official fallback roots: ${#OFFICIAL_FETCH_PKGS[@]}"$'\n'
             if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
-              SUMMARY+="### Missing Requested APKs"$'\n'
+              SUMMARY+="### Missing Locally Built Requested APKs"$'\n'
               for pkg in "${!MISSING_PKGS[@]}"; do SUMMARY+="- $pkg"$'\n'; done
             fi
             if [ "${#OFFICIAL_FETCH_PKGS[@]}" -gt 0 ]; then
-              SUMMARY+="### Official Fetch Roots"$'\n'
+              SUMMARY+="### Official Fallback Roots"$'\n'
               for pkg in "${!OFFICIAL_FETCH_PKGS[@]}"; do SUMMARY+="- $pkg"$'\n'; done
-            fi
-            if [ "${#MISSING_LOCAL_DEPS[@]}" -gt 0 ]; then
-              SUMMARY+="### Unresolved Local Dependencies"$'\n'
-              for pkg in "${!MISSING_LOCAL_DEPS[@]}"; do SUMMARY+="- $pkg"$'\n'; done
             fi
             gh_summary "$SUMMARY"
           }
