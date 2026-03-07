@@ -305,10 +305,6 @@ jobs:
           CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=m
           EOF
 
-          while IFS= read -r suffix; do
-            echo "CONFIG_PACKAGE_luci-app-passwall_${suffix}=y" >> .config
-          done < <(sed -n 's/^config PACKAGE_\$\(PKG_NAME\)_\([A-Za-z0-9_]*\)$/\1/p' "$PASSWALL_MK")
-
           make defconfig </dev/null
 
           python3 - <<'PY'
@@ -334,7 +330,7 @@ jobs:
 
           out = root / ".passwall-package-roots"
           out.write_text("\n".join(sorted(dict.fromkeys(roots))) + "\n")
-          print(f"generated {len(set(roots))} passwall root packages")
+          print(f"generated {len(set(roots))} passwall root packages from default-selected features")
           PY
 
           [ -s "$PASSWALL_ROOTS" ] || die "Auto-generated PassWall package root list is empty"

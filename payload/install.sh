@@ -38,9 +38,6 @@ for f in luci-i18n-passwall-zh-cn-*.apk luci-i18n-passwall-zh-cn_*.apk; do
   [ -e "$f" ] && { zh_pkg="$f"; break; }
 done
 
-# ── 更新软件源 / Update package lists ──
-retry 3 5 apk update || die "apk update failed"
-
 # ── 构建安装列表 / Build install list ──
 set -- "$pw_pkg"
 [ -n "$zh_pkg" ] && set -- "$@" "$zh_pkg"

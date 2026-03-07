@@ -13,7 +13,7 @@ Automatically compiles PassWall and all dependencies via GitHub Actions into a s
 - **Rust 编译优化**（并行代码生成、优化 RUSTFLAGS）
 - 编译自动降级（并行 → 单线程）
 - 适配 OpenWrt 25.12+ APK 包管理器
-- 自动分析 luci-app-passwall 选择的功能包并本地编译 PassWall 相关组件
+- 按 luci-app-passwall 的默认功能开关与目标架构条件自动分析并本地编译 PassWall 相关组件
 - 对缺失的系统依赖 APK 自动从官方 OpenWrt 源拉取并并入 `.run`
 - 每日自动检查上游 PassWall 稳定版并在有新版本时自动触发构建
 
@@ -77,7 +77,7 @@ build-installer.yml (single file, multi-step)
 
 所有构建逻辑内联在 `build-installer.yml` 工作流的各个步骤中，共享函数通过 `scripts/utils.sh` 提供。
 
-工作流会从 `luci-app-passwall` 的 Makefile 自动分析已启用的功能开关，生成 PassWall 根包列表。本地优先编译 `openwrt-passwall-packages` 中的相关组件；对递归依赖闭包里缺失的系统 APK，再从与 SDK 同版本同架构的官方 OpenWrt 源拉取并打包进 `.run`。
+工作流会从 `luci-app-passwall` 的 Makefile 自动分析默认启用的功能开关，并结合目标架构条件生成 PassWall 根包列表。本地优先编译 `openwrt-passwall-packages` 中的相关组件；对递归依赖闭包里缺失的系统 APK，再从与 SDK 同版本同架构的官方 OpenWrt 源拉取并打包进 `.run`。
 
 ## 性能优化 | Performance
 
@@ -107,7 +107,7 @@ build-installer.yml (single file, multi-step)
 
 ### xray-plugin 编译失败？
 
-xray-plugin 可能因为其依赖 `github.com/sagernet/sing` 与较新版本的 Go（如 Go 1.25+）不兼容而编译失败，报错类似 `invalid reference to net.errNoSuchInterface`。这是上游依赖兼容性问题，需要等待 [openwrt-passwall-packages](https://github.com/Openwrt-Passwall/openwrt-passwall-packages) 更新 xray-plugin 或其依赖版本后才能解决。xray-plugin 编译失败不影响其他包的正常构建。
+xray-plugin 可能因为其依赖 `github.com/sagernet/sing` 与较新版本的 Go（如 Go 1.25+）不兼容而编译失败，报错类似 `invalid reference to net.errNoSuchInterface`。这是上游依赖兼容性问题，需要等待 [openwrt-passwall-packages](https://github.com/Openwrt-Passwall/openwrt-passwall-packages) 更新 xray-plugin 或其依赖版本后才能解决。当前工作流采用失败即终止策略，因此若它位于本次默认启用的构建集合中，编译失败会直接导致 workflow 失败。
 
 ## License
 
