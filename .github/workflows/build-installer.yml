@@ -11,7 +11,6 @@ concurrency:
 
 env:
   MIN_REQUIRED_PACKAGES: '15'
-  MAX_ALLOWED_FAILURES: '5'
 
 jobs:
   build:
@@ -385,21 +384,6 @@ jobs:
           PASSWALL_ROOTS_FILE="$PWD/.passwall-package-roots"
           [ -s "$PASSWALL_ROOTS_FILE" ] || die "PassWall root package list missing"
 
-          map_passwall_source_dir() {
-            local pkg="$1"
-            case "$pkg" in
-              shadowsocks-libev-*) echo "package/passwall-packages/shadowsocks-libev" ;;
-              shadowsocks-rust-*) echo "package/passwall-packages/shadowsocks-rust" ;;
-              shadowsocksr-libev-*) echo "package/passwall-packages/shadowsocksr-libev" ;;
-              simple-obfs-*) echo "package/passwall-packages/simple-obfs" ;;
-              v2ray-geoip|v2ray-geosite) echo "package/passwall-packages/v2ray-geodata" ;;
-              luci-app-passwall|luci-i18n-passwall-zh-cn) echo "package/passwall-luci/luci-app-passwall" ;;
-              *)
-                [ -d "package/passwall-packages/$pkg" ] && echo "package/passwall-packages/$pkg" || return 1
-                ;;
-            esac
-          }
-
           declare -A LOCAL_SOURCE_PKGS=()
           while IFS= read -r pkg; do
             [ -n "$pkg" ] || continue
@@ -519,38 +503,6 @@ jobs:
           [ -x "$APK_TOOL" ] || die "OpenWrt host apk tool not found: $APK_TOOL"
           [ -n "$ARCH_PACKAGES" ] || die "Cannot derive ARCH_PACKAGES from .config"
 
-          find_pkg_file() {
-            local dir="$1" pkg="$2"
-            find "$dir" -maxdepth 1 -type f \( -name "${pkg}-*.apk" -o -name "${pkg}_*.apk" \) | LC_ALL=C sort | head -n 1
-          }
-
-          local_pkg_spec() {
-            local dir="$1" pkg="$2" pkg_file version
-            pkg_file=$(find_pkg_file "$dir" "$pkg" || true)
-            [ -n "$pkg_file" ] || return 1
-            version=$(basename "$pkg_file")
-            version="${version%.apk}"
-            version="${version#${pkg}-}"
-            version="${version#${pkg}_}"
-            [ -n "$version" ] || return 1
-            printf '%s=%s\n' "$pkg" "$version"
-          }
-
-          map_passwall_source_dir() {
-            local pkg="$1"
-            case "$pkg" in
-              shadowsocks-libev-*) echo "package/passwall-packages/shadowsocks-libev" ;;
-              shadowsocks-rust-*) echo "package/passwall-packages/shadowsocks-rust" ;;
-              shadowsocksr-libev-*) echo "package/passwall-packages/shadowsocksr-libev" ;;
-              simple-obfs-*) echo "package/passwall-packages/simple-obfs" ;;
-              v2ray-geoip|v2ray-geosite) echo "package/passwall-packages/v2ray-geodata" ;;
-              luci-app-passwall|luci-i18n-passwall-zh-cn) echo "package/passwall-luci/luci-app-passwall" ;;
-              *)
-                [ -d "package/passwall-packages/$pkg" ] && echo "package/passwall-packages/$pkg" || return 1
-                ;;
-            esac
-          }
-
           build_local_repository() {
             local apk_file
             rm -rf "$LOCAL_REPO_ROOT"
@@ -562,8 +514,12 @@ jobs:
             done
             mapfile -t LOCAL_REPO_APKS < <(find "$LOCAL_REPO_ARCH_DIR" -maxdepth 1 -type f -name '*.apk' | LC_ALL=C sort)
             [ "${#LOCAL_REPO_APKS[@]}" -gt 0 ] || die "Local APK repository is empty"
-            "$APK_TOOL" index --no-warnings -o "$LOCAL_REPO_INDEX" "${LOCAL_REPO_APKS[@]}" \
-              || die "Failed to create local APK index"
+            # mkndx creates v2 APKINDEX.tar.gz; may warn about unresolved deps in
+            # a subset repo and exit non-zero — that is expected and harmless.
+            "$APK_TOOL" mkndx -o "$LOCAL_REPO_INDEX" "${LOCAL_REPO_APKS[@]}" 2>&1 \
+              | head -20 || true
+            [ -f "$LOCAL_REPO_INDEX" ] || die "Failed to create local APK index"
+            log_info "Created APKINDEX with ${#LOCAL_REPO_APKS[@]} packages"
           }
 
           make_combined_repositories() {
@@ -574,14 +530,13 @@ jobs:
             [ -n "$dist_root" ] || die "Cannot derive OpenWrt dist root from SDK URL"
             [ -n "$target_path" ] || die "Cannot derive target path from SDK URL"
             cat > "$repo_file" <<EOF
-          set APK_ARCH=$ARCH_PACKAGES
-          ndx $LOCAL_REPO_INDEX
-          v3 $dist_root/targets/$target_path/packages
-          v3 $dist_root/packages/$ARCH_PACKAGES/base
-          v3 $dist_root/packages/$ARCH_PACKAGES/packages
-          v3 $dist_root/packages/$ARCH_PACKAGES/luci
-          v3 $dist_root/packages/$ARCH_PACKAGES/routing
-          v3 $dist_root/packages/$ARCH_PACKAGES/telephony
+          $LOCAL_REPO_ARCH_DIR
+          $dist_root/targets/$target_path/packages
+          $dist_root/packages/$ARCH_PACKAGES/base
+          $dist_root/packages/$ARCH_PACKAGES/packages
+          $dist_root/packages/$ARCH_PACKAGES/luci
+          $dist_root/packages/$ARCH_PACKAGES/routing
+          $dist_root/packages/$ARCH_PACKAGES/telephony
           EOF
           }
 

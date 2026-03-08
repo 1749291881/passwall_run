@@ -106,3 +106,42 @@ gh_set_env() {
 gh_summary() {
   [ -n "${GITHUB_STEP_SUMMARY:-}" ] && printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
 }
+
+# ── PassWall 源目录映射 / PassWall source directory mapping ──
+# Maps a package name to its source directory inside the SDK tree.
+# Must be called with cwd = SDK root.
+map_passwall_source_dir() {
+  local pkg="$1"
+  case "$pkg" in
+    shadowsocks-libev-*) echo "package/passwall-packages/shadowsocks-libev" ;;
+    shadowsocks-rust-*) echo "package/passwall-packages/shadowsocks-rust" ;;
+    shadowsocksr-libev-*) echo "package/passwall-packages/shadowsocksr-libev" ;;
+    simple-obfs-*) echo "package/passwall-packages/simple-obfs" ;;
+    v2ray-geoip|v2ray-geosite) echo "package/passwall-packages/v2ray-geodata" ;;
+    luci-app-passwall|luci-i18n-passwall-zh-cn) echo "package/passwall-luci/luci-app-passwall" ;;
+    *)
+      [ -d "package/passwall-packages/$pkg" ] && echo "package/passwall-packages/$pkg" || return 1
+      ;;
+  esac
+}
+
+# ── APK 文件查找 / Find APK file by package name ──
+# Finds the APK file for a given package name in a directory.
+find_pkg_file() {
+  local dir="$1" pkg="$2"
+  find "$dir" -maxdepth 1 -type f \( -name "${pkg}-[0-9]*.apk" -o -name "${pkg}_[0-9]*.apk" \) \
+    | LC_ALL=C sort | head -n 1
+}
+
+# ── APK 版本规格 / Derive pinned "pkg=version" spec from APK filename ──
+local_pkg_spec() {
+  local dir="$1" pkg="$2" pkg_file version
+  pkg_file=$(find_pkg_file "$dir" "$pkg" || true)
+  [ -n "$pkg_file" ] || return 1
+  version=$(basename "$pkg_file")
+  version="${version%.apk}"
+  version="${version#${pkg}-}"
+  version="${version#${pkg}_}"
+  [ -n "$version" ] || return 1
+  printf '%s=%s\n' "$pkg" "$version"
+}
