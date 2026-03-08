@@ -11,6 +11,9 @@ concurrency:
 
 env:
   MIN_REQUIRED_PACKAGES: '15'
+  CCACHE_MAX_SIZE_MB: '2048'
+  DL_CACHE_MAX_SIZE_MB: '4096'
+  GO_BUILD_CACHE_MAX_SIZE_MB: '2048'
 
 jobs:
   build:
@@ -141,6 +144,7 @@ jobs:
           # Link dl/ to persistent cache
           DL_CACHE="${GITHUB_WORKSPACE}/.cache/dl"
           mkdir -p "$DL_CACHE"
+          trim_cache_dir "$DL_CACHE" "${DL_CACHE_MAX_SIZE_MB}" "download"
           rm -rf dl
           ln -sf "$DL_CACHE" dl
           log_info "Download cache: $(find "$DL_CACHE" -type f 2>/dev/null | wc -l) cached files"
@@ -148,6 +152,7 @@ jobs:
           # OpenWrt sets GOCACHE=$(TMP_DIR)/go-build; GOMODCACHE/CARGO_HOME go via dl/
           GO_BUILD_CACHE="${GITHUB_WORKSPACE}/.cache/go-build"
           mkdir -p "$GO_BUILD_CACHE" tmp
+          trim_cache_dir "$GO_BUILD_CACHE" "${GO_BUILD_CACHE_MAX_SIZE_MB}" "go-build"
           rm -rf tmp/go-build
           ln -sf "$GO_BUILD_CACHE" tmp/go-build
           log_info "Go build cache: $(find "$GO_BUILD_CACHE" -type f 2>/dev/null | wc -l) cached files"
@@ -397,7 +402,7 @@ jobs:
           export CCACHE_DIR="$HOME/.ccache"
           export PATH="/usr/lib/ccache:$PATH"
           mkdir -p "$CCACHE_DIR"
-          ccache -M 2G
+          ccache -M "${CCACHE_MAX_SIZE_MB}M"
           ccache -z
 
           # Cargo 环境 (codegen-units / opt-level / lto / RUSTFLAGS 均由 OpenWrt cargo.mk 控制)
@@ -519,9 +524,8 @@ jobs:
 
           APK_TOOL="staging_dir/host/bin/apk"
           ARCH_PACKAGES=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"/\1/p' .config | head -n 1)
-          LOCAL_REPO_ROOT="$PWD/.local-apk-repo"
-          LOCAL_REPO_ARCH_DIR="$LOCAL_REPO_ROOT/$ARCH_PACKAGES"
-          LOCAL_REPO_INDEX="$LOCAL_REPO_ARCH_DIR/packages.adb"
+          LOCAL_REPO_ROOT="$PWD/bin/packages"
+          LOCAL_REPO_INDEX_LIST="$PWD/.local-repositories"
           FETCH_DIR="$PWD/.resolved-apks"
 
           [ -x "$APK_TOOL" ] || die "OpenWrt host apk tool not found: $APK_TOOL"
@@ -530,53 +534,23 @@ jobs:
           log_info "ARCH_PACKAGES: $ARCH_PACKAGES"
 
           build_local_repository() {
-            local apk_file sdk_root
-            sdk_root="$PWD"
-            rm -rf "$LOCAL_REPO_ROOT"
-            mkdir -p "$LOCAL_REPO_ARCH_DIR"
-            mapfile -t LOCAL_APK_FILES < <(find bin/packages -type f -name '*.apk' | LC_ALL=C sort)
-            [ "${#LOCAL_APK_FILES[@]}" -gt 0 ] || die "No built APKs found in bin/packages"
-            for apk_file in "${LOCAL_APK_FILES[@]}"; do
-              cp -f "$apk_file" "$LOCAL_REPO_ARCH_DIR/"
-            done
-            mapfile -t LOCAL_REPO_APKS < <(find "$LOCAL_REPO_ARCH_DIR" -maxdepth 1 -type f -name '*.apk' | LC_ALL=C sort)
-            [ "${#LOCAL_REPO_APKS[@]}" -gt 0 ] || die "Local APK repository is empty"
-
-            # Create packages.adb (v3 format) from local APKs.
-            # Run mkndx with the same root/key-dir model OpenWrt uses when it
-            # generates packages.adb for APK feeds.
-            # Redirect output to a log file (NOT a pipe) to avoid SIGPIPE killing
-            # the process before it finishes writing the index.
-            # --allow-untrusted: self-built APKs are not signed.
-            local mkndx_log="/tmp/mkndx-$$.log"
-            if (
-              cd "$LOCAL_REPO_ARCH_DIR"
-              "$APK_TOOL" mkndx \
-                --root "$sdk_root" \
-                --keys-dir "$sdk_root" \
-                --allow-untrusted \
-                --output packages.adb \
-                ./*.apk
-            ) >"$mkndx_log" 2>&1; then
-              log_info "apk mkndx succeeded"
+            local mkndx_log="/tmp/package-index-$$.log"
+            [ -d "$LOCAL_REPO_ROOT" ] || die "Local package directory missing: $LOCAL_REPO_ROOT"
+            find "$LOCAL_REPO_ROOT" -type f -name 'packages.adb' -delete 2>/dev/null || true
+            if make package/index V=s >"$mkndx_log" 2>&1; then
+              log_info "make package/index succeeded"
             else
-              log_warn "apk mkndx failed with repo-local glob input, retrying with absolute APK paths"
-              if "$APK_TOOL" mkndx \
-                   --root "$sdk_root" \
-                   --keys-dir "$sdk_root" \
-                   --allow-untrusted \
-                   --output "$LOCAL_REPO_INDEX" \
-                   "${LOCAL_REPO_APKS[@]}" >>"$mkndx_log" 2>&1; then
-                log_info "apk mkndx succeeded on retry with absolute APK paths"
-              else
-                log_warn "apk mkndx still failed; log tail follows:"
-                tail -40 "$mkndx_log" || true
-              fi
+              log_warn "make package/index failed; log tail follows:"
+              tail -60 "$mkndx_log" || true
+              rm -f "$mkndx_log"
+              die "Failed to generate local APK repository indexes"
             fi
             rm -f "$mkndx_log"
 
-            [ -f "$LOCAL_REPO_INDEX" ] || die "Failed to create local APK index \u2014 apk mkndx did not produce output file"
-            log_info "Created packages.adb index with ${#LOCAL_REPO_APKS[@]} packages"
+            mapfile -t LOCAL_REPO_INDEXES < <(find "$LOCAL_REPO_ROOT" -type f -name 'packages.adb' | LC_ALL=C sort)
+            [ "${#LOCAL_REPO_INDEXES[@]}" -gt 0 ] || die "No local packages.adb indexes found under $LOCAL_REPO_ROOT"
+            printf '%s\n' "${LOCAL_REPO_INDEXES[@]}" > "$LOCAL_REPO_INDEX_LIST"
+            log_info "Generated ${#LOCAL_REPO_INDEXES[@]} local repository indexes"
           }
 
           make_combined_repositories() {
@@ -588,8 +562,8 @@ jobs:
             [ -n "$target_path" ] || die "Cannot derive target path from SDK URL"
             # apk v3 repositories-file entries must point to packages.adb files,
             # not directories. See include/feeds.mk in the OpenWrt build system.
-            cat > "$repo_file" <<EOF
-          $LOCAL_REPO_INDEX
+            cat "$LOCAL_REPO_INDEX_LIST" > "$repo_file"
+            cat >> "$repo_file" <<EOF
           $dist_root/targets/$target_path/packages/packages.adb
           $dist_root/packages/$ARCH_PACKAGES/base/packages.adb
           $dist_root/packages/$ARCH_PACKAGES/packages/packages.adb
@@ -623,11 +597,11 @@ jobs:
           build_local_repository
 
           TOPLEVEL_PKGS["luci-app-passwall"]=1
-          luci_spec=$(local_pkg_spec "$LOCAL_REPO_ARCH_DIR" "luci-app-passwall" || true)
+          luci_spec=$(local_pkg_spec "$LOCAL_REPO_ROOT" "luci-app-passwall" || true)
           [ -n "$luci_spec" ] || die "luci-app-passwall APK not found in local repository"
           REQUESTED_SPECS=("$luci_spec")
 
-          zh_spec=$(local_pkg_spec "$LOCAL_REPO_ARCH_DIR" "luci-i18n-passwall-zh-cn" || true)
+          zh_spec=$(local_pkg_spec "$LOCAL_REPO_ROOT" "luci-i18n-passwall-zh-cn" || true)
           if [ -n "$zh_spec" ]; then
             TOPLEVEL_PKGS["luci-i18n-passwall-zh-cn"]=1
             REQUESTED_SPECS+=("$zh_spec")
@@ -639,7 +613,7 @@ jobs:
           while IFS= read -r p; do
             [ -n "$p" ] || continue
             ROOT_COUNT=$((ROOT_COUNT + 1))
-            pkg_spec=$(local_pkg_spec "$LOCAL_REPO_ARCH_DIR" "$p" || true)
+            pkg_spec=$(local_pkg_spec "$LOCAL_REPO_ROOT" "$p" || true)
             if [ -n "$pkg_spec" ]; then
               REQUESTED_SPECS+=("$pkg_spec")
             else
@@ -765,6 +739,14 @@ jobs:
           step_end
 
       # ── 保存缓存 / Save caches ──
+      - name: Trim build caches
+        if: always()
+        run: |
+          source scripts/utils.sh
+          trim_cache_dir "$HOME/.ccache" "${CCACHE_MAX_SIZE_MB}" "ccache"
+          trim_cache_dir "${GITHUB_WORKSPACE}/.cache/dl" "${DL_CACHE_MAX_SIZE_MB}" "download"
+          trim_cache_dir "${GITHUB_WORKSPACE}/.cache/go-build" "${GO_BUILD_CACHE_MAX_SIZE_MB}" "go-build"
+
       - name: Save build caches
         if: always()
         uses: actions/cache/save@v4
