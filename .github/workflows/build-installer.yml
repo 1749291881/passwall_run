@@ -502,6 +502,8 @@ jobs:
 
           [ -x "$APK_TOOL" ] || die "OpenWrt host apk tool not found: $APK_TOOL"
           [ -n "$ARCH_PACKAGES" ] || die "Cannot derive ARCH_PACKAGES from .config"
+          log_info "APK tool: $("$APK_TOOL" --version 2>&1 || echo 'unknown version')"
+          log_info "ARCH_PACKAGES: $ARCH_PACKAGES"
 
           build_local_repository() {
             local apk_file
@@ -514,11 +516,22 @@ jobs:
             done
             mapfile -t LOCAL_REPO_APKS < <(find "$LOCAL_REPO_ARCH_DIR" -maxdepth 1 -type f -name '*.apk' | LC_ALL=C sort)
             [ "${#LOCAL_REPO_APKS[@]}" -gt 0 ] || die "Local APK repository is empty"
-            # mkndx creates v2 APKINDEX.tar.gz; may warn about unresolved deps in
-            # a subset repo and exit non-zero — that is expected and harmless.
-            "$APK_TOOL" mkndx -o "$LOCAL_REPO_INDEX" "${LOCAL_REPO_APKS[@]}" 2>&1 \
-              | head -20 || true
-            [ -f "$LOCAL_REPO_INDEX" ] || die "Failed to create local APK index"
+
+            # Create APKINDEX.tar.gz from local APKs.
+            # mkndx may exit non-zero for dep warnings on a subset repo — that is
+            # expected. Redirect output to a log file (NOT a pipe) to avoid SIGPIPE
+            # killing the process before it finishes writing the index.
+            local mkndx_log="/tmp/mkndx-$$.log"
+            if "$APK_TOOL" mkndx --output "$LOCAL_REPO_INDEX" "${LOCAL_REPO_APKS[@]}" \
+                 >"$mkndx_log" 2>&1; then
+              log_info "apk mkndx succeeded"
+            else
+              log_warn "apk mkndx exited non-zero (may be harmless dep warnings):"
+              head -20 "$mkndx_log" || true
+            fi
+            rm -f "$mkndx_log"
+
+            [ -f "$LOCAL_REPO_INDEX" ] || die "Failed to create local APK index — apk mkndx did not produce output file"
             log_info "Created APKINDEX with ${#LOCAL_REPO_APKS[@]} packages"
           }
 
@@ -538,6 +551,8 @@ jobs:
           $dist_root/packages/$ARCH_PACKAGES/routing
           $dist_root/packages/$ARCH_PACKAGES/telephony
           EOF
+            log_info "Combined repositories file:"
+            cat "$repo_file"
           }
 
           fetch_resolved_packages() {
@@ -546,14 +561,16 @@ jobs:
             [ "$#" -gt 0 ] || return 0
             rm -rf "$dest_dir"
             mkdir -p "$dest_dir"
+            log_info "Fetching ${#} package specs from combined repos…"
             "$APK_TOOL" \
               --allow-untrusted \
               --force-missing-repositories \
               --force-refresh \
               --no-interactive \
+              --no-cache \
               --arch "$ARCH_PACKAGES" \
               --repositories-file "$repo_file" \
-              fetch --recursive -o "$dest_dir" "$@"
+              fetch --recursive --output "$dest_dir" "$@"
           }
 
           group_start "Collect packages"
