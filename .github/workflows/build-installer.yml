@@ -34,13 +34,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
             ~/.ccache
             .cache/dl
+            .cache/go-build
           key: build-${{ hashFiles('config/openwrt-sdk.conf') }}-${{ github.run_number }}
           restore-keys: |
             build-${{ hashFiles('config/openwrt-sdk.conf') }}-
@@ -148,6 +144,13 @@ jobs:
           rm -rf dl
           ln -sf "$DL_CACHE" dl
           log_info "Download cache: $(find "$DL_CACHE" -type f 2>/dev/null | wc -l) cached files"
+          # Link Go build cache to persistent cache
+          # OpenWrt sets GOCACHE=$(TMP_DIR)/go-build; GOMODCACHE/CARGO_HOME go via dl/
+          GO_BUILD_CACHE="${GITHUB_WORKSPACE}/.cache/go-build"
+          mkdir -p "$GO_BUILD_CACHE" tmp
+          rm -rf tmp/go-build
+          ln -sf "$GO_BUILD_CACHE" tmp/go-build
+          log_info "Go build cache: $(find "$GO_BUILD_CACHE" -type f 2>/dev/null | wc -l) cached files"
 
           cd ..
           group_end
@@ -390,28 +393,16 @@ jobs:
           # Rust ≥1.90 bootstrap panics when CI env vars are set
           unset CI GITHUB_ACTIONS
 
-          # ccache for C/C++ host compilation
+          # ccache — 仅加速宿主机 C/C++ 编译; 交叉编译由 OpenWrt 工具链全路径调用，不经过 PATH
           export CCACHE_DIR="$HOME/.ccache"
           export PATH="/usr/lib/ccache:$PATH"
           mkdir -p "$CCACHE_DIR"
           ccache -M 2G
           ccache -z
 
-          # Rust 编译优化 / Rust compilation optimizations
-          RUST_CODEGEN_UNITS="${RUST_CODEGEN_UNITS:-8}"
-          RUST_LTO_MODE="${RUST_LTO_MODE:-off}"
-          RUST_OPT_LEVEL="${RUST_OPT_LEVEL:-3}"
-          RUST_EXTRA_FLAGS="-C codegen-units=${RUST_CODEGEN_UNITS} -C opt-level=${RUST_OPT_LEVEL}"
-          [ "$RUST_LTO_MODE" != "off" ] && RUST_EXTRA_FLAGS+=" -C lto=${RUST_LTO_MODE}"
-          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }${RUST_EXTRA_FLAGS}"
+          # Cargo 环境 (codegen-units / opt-level / lto / RUSTFLAGS 均由 OpenWrt cargo.mk 控制)
           export CARGO_INCREMENTAL=0
           export CARGO_NET_GIT_FETCH_WITH_CLI=true
-          export CARGO_PROFILE_RELEASE_DEBUG=0
-
-          log_info "RUSTFLAGS=$RUSTFLAGS"
-          log_info "RUST_LTO_MODE=$RUST_LTO_MODE"
-          log_info "CARGO_INCREMENTAL=$CARGO_INCREMENTAL"
-          log_info "CARGO_PROFILE_RELEASE_DEBUG=$CARGO_PROFILE_RELEASE_DEBUG"
 
           PASSWALL_ROOTS_FILE="$PWD/.passwall-package-roots"
           [ -s "$PASSWALL_ROOTS_FILE" ] || die "PassWall root package list missing"
