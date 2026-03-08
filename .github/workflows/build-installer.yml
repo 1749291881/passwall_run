@@ -31,7 +31,7 @@ jobs:
 
       # ── 构建缓存 / Build caches ──
       - name: Restore build caches
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.ccache
@@ -744,6 +744,17 @@ jobs:
           echo "run_name=${RUN_NAME}" >> "$GITHUB_OUTPUT"
 
           step_end
+
+      # ── 保存缓存 / Save caches ──
+      - name: Save build caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.ccache
+            .cache/dl
+            .cache/go-build
+          key: build-${{ hashFiles('config/openwrt-sdk.conf') }}-${{ github.run_number }}
 
       # ── 发布 / Publish ──
       - name: Upload artifact
