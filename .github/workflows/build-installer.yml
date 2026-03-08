@@ -530,7 +530,8 @@ jobs:
           log_info "ARCH_PACKAGES: $ARCH_PACKAGES"
 
           build_local_repository() {
-            local apk_file
+            local apk_file sdk_root
+            sdk_root="$PWD"
             rm -rf "$LOCAL_REPO_ROOT"
             mkdir -p "$LOCAL_REPO_ARCH_DIR"
             mapfile -t LOCAL_APK_FILES < <(find bin/packages -type f -name '*.apk' | LC_ALL=C sort)
@@ -542,24 +543,31 @@ jobs:
             [ "${#LOCAL_REPO_APKS[@]}" -gt 0 ] || die "Local APK repository is empty"
 
             # Create packages.adb (v3 format) from local APKs.
-            # Run mkndx from inside the repository directory, matching OpenWrt's
-            # own package index generation flow for APK feeds.
+            # Run mkndx with the same root/key-dir model OpenWrt uses when it
+            # generates packages.adb for APK feeds.
             # Redirect output to a log file (NOT a pipe) to avoid SIGPIPE killing
             # the process before it finishes writing the index.
             # --allow-untrusted: self-built APKs are not signed.
             local mkndx_log="/tmp/mkndx-$$.log"
             if (
               cd "$LOCAL_REPO_ARCH_DIR"
-              "$APK_TOOL" mkndx --allow-untrusted --output packages.adb ./*.apk
+              "$APK_TOOL" mkndx \
+                --root "$sdk_root" \
+                --keys-dir "$sdk_root" \
+                --allow-untrusted \
+                --output packages.adb \
+                ./*.apk
             ) >"$mkndx_log" 2>&1; then
               log_info "apk mkndx succeeded"
             else
-              log_warn "apk mkndx exited non-zero on repo-local invocation, retrying with explicit --root"
-              if (
-                cd "$LOCAL_REPO_ARCH_DIR"
-                "$APK_TOOL" mkndx --root "$PWD" --allow-untrusted --output packages.adb ./*.apk
-              ) >>"$mkndx_log" 2>&1; then
-                log_info "apk mkndx succeeded on retry with --root"
+              log_warn "apk mkndx failed with repo-local glob input, retrying with absolute APK paths"
+              if "$APK_TOOL" mkndx \
+                   --root "$sdk_root" \
+                   --keys-dir "$sdk_root" \
+                   --allow-untrusted \
+                   --output "$LOCAL_REPO_INDEX" \
+                   "${LOCAL_REPO_APKS[@]}" >>"$mkndx_log" 2>&1; then
+                log_info "apk mkndx succeeded on retry with absolute APK paths"
               else
                 log_warn "apk mkndx still failed; log tail follows:"
                 tail -40 "$mkndx_log" || true
