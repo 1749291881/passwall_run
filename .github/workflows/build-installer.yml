@@ -549,7 +549,7 @@ jobs:
 
             mapfile -t LOCAL_REPO_INDEXES < <(find "$LOCAL_REPO_ROOT" -type f -name 'packages.adb' | LC_ALL=C sort)
             [ "${#LOCAL_REPO_INDEXES[@]}" -gt 0 ] || die "No local packages.adb indexes found under $LOCAL_REPO_ROOT"
-            printf '%s\n' "${LOCAL_REPO_INDEXES[@]}" > "$LOCAL_REPO_INDEX_LIST"
+            printf 'file://%s\n' "${LOCAL_REPO_INDEXES[@]}" > "$LOCAL_REPO_INDEX_LIST"
             log_info "Generated ${#LOCAL_REPO_INDEXES[@]} local repository indexes"
           }
 
@@ -633,6 +633,11 @@ jobs:
           make_combined_repositories "$COMBINED_REPO_FILE"
           fetch_resolved_packages "$COMBINED_REPO_FILE" "$FETCH_DIR" "${REQUESTED_SPECS[@]}" \
             || die "Failed to resolve dependency closure from local and official repositories"
+
+          while IFS= read -r -d '' apk_file; do
+            base_name=$(basename "$apk_file")
+            [ -f "$FETCH_DIR/$base_name" ] || cp "$apk_file" "$FETCH_DIR/"
+          done < <(find "$LOCAL_REPO_ROOT" -type f -name '*.apk' -print0)
 
           for pkg in "${!TOPLEVEL_PKGS[@]}"; do
             pkg_file=$(find_pkg_file "$FETCH_DIR" "$pkg" || true)
